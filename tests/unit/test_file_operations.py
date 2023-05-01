@@ -3,6 +3,8 @@ This set of unit tests is designed to test the file operations that autoGPT has 
 """
 
 import os
+import random
+import string
 from pathlib import Path
 from tempfile import gettempdir
 
@@ -13,6 +15,7 @@ from autogpt.commands.file_operations import (
     check_duplicate_operation,
     delete_file,
     download_file,
+    ingest_file,
     list_files,
     log_operation,
     read_file,
@@ -20,6 +23,8 @@ from autogpt.commands.file_operations import (
     write_to_file,
 )
 from autogpt.config import Config
+from autogpt.logs import Logger
+from autogpt.memory import get_memory
 from autogpt.utils import readable_file_size
 
 
@@ -167,3 +172,97 @@ def test_download_file():
 
     url = "https://thiswebsiteiswrong.hmm/v0.0.0.tar.gz"
     assert "Failed to establish a new connection:" in download_file(url, local_name)
+
+
+@pytest.fixture
+def ingest_config():
+    class IngestConfig:
+        chunks_cnt = 5
+        max_len = 10
+        overlap = 0
+        filename = "file_to_ingest.txt"
+        length = chunks_cnt * max_len
+
+    return IngestConfig()
+
+
+@pytest.fixture
+def file_content(ingest_config):
+    random.seed(42)
+    return "".join(random.choices(string.ascii_letters, k=ingest_config.length))
+
+
+@pytest.fixture
+def file_to_ingest(workspace, ingest_config, file_content):
+    file = workspace.get_path(ingest_config.filename)
+    with open(file, "w") as f:
+        f.write(file_content)
+    return file
+
+
+def test_ingest_file(config, file_to_ingest, ingest_config, file_content, mocker):
+    memory = get_memory(config, True)
+    mock_logger = mocker.patch.object(Logger, "info")
+    mock_memory = mocker.patch.object(memory, "add")
+
+    ingest_file(
+        str(file_to_ingest), memory, ingest_config.max_len, ingest_config.overlap
+    )
+
+    expected_log_calls = (
+        [
+            mocker.call(f"Working with file {file_to_ingest}"),
+            mocker.call(f"File length: {ingest_config.length} characters"),
+        ]
+        + [
+            mocker.call(
+                f"Ingesting chunk {i + 1} / {ingest_config.chunks_cnt} into memory"
+            )
+            for i in range(ingest_config.chunks_cnt)
+        ]
+        + [
+            mocker.call(
+                f"Done ingesting {ingest_config.chunks_cnt} chunks from {file_to_ingest}."
+            ),
+        ]
+    )
+
+    actual_log_calls = mock_logger.call_args_list
+    assert actual_log_calls == expected_log_calls
+
+    chunks = list(
+        split_file(
+            file_content,
+            max_length=ingest_config.max_len,
+            overlap=ingest_config.overlap,
+        )
+    )
+
+    expected_memory_calls = [
+        mocker.call(
+            f"Filename: {file_to_ingest}\n"
+            f"Content part#{i + 1}/{ingest_config.chunks_cnt}: {chunk}"
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+
+    actual_memory_calls = mock_memory.call_args_list
+    assert actual_memory_calls == expected_memory_calls
+
+
+def test_ingest_file_error(config, file_to_ingest, ingest_config, mocker):
+    mock_logger = mocker.patch.object(Logger, "info")
+
+    ingest_file(str(file_to_ingest), None, ingest_config.max_len, ingest_config.overlap)
+
+    expected_calls = [
+        mocker.call(f"Working with file {file_to_ingest}"),
+        mocker.call(f"File length: {ingest_config.length} characters"),
+        mocker.call("Ingesting chunk 1 / 5 into memory"),
+        mocker.call(
+            f"Error while ingesting file '{file_to_ingest}': 'NoneType' object has no attribute 'add'"
+        ),
+    ]
+
+    actual_calls = mock_logger.call_args_list
+    assert actual_calls == expected_calls
